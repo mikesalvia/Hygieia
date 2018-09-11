@@ -7,11 +7,12 @@ import com.capitalone.dashboard.model.Commit;
 import com.capitalone.dashboard.model.CommitStatus;
 import com.capitalone.dashboard.model.CommitType;
 import com.capitalone.dashboard.model.GitHubGraphQLQuery;
+import com.capitalone.dashboard.model.GitHubPaging;
 import com.capitalone.dashboard.model.GitHubParsed;
 import com.capitalone.dashboard.model.GitHubRateLimit;
 import com.capitalone.dashboard.model.GitHubRepo;
 import com.capitalone.dashboard.model.GitRequest;
-import com.capitalone.dashboard.model.GitHubPaging;
+import com.capitalone.dashboard.model.MergeEvent;
 import com.capitalone.dashboard.model.Review;
 import com.capitalone.dashboard.util.Encryption;
 import com.capitalone.dashboard.util.EncryptionException;
@@ -53,6 +54,7 @@ import java.util.stream.Collectors;
  * Subversion repositories.
  */
 @Component
+@SuppressWarnings("PMD.ExcessiveClassLength")
 public class DefaultGitHubClient implements GitHubClient {
     private static final Log LOG = LogFactory.getLog(DefaultGitHubClient.class);
 
@@ -63,6 +65,7 @@ public class DefaultGitHubClient implements GitHubClient {
     private List<Commit> commits;
     private List<GitRequest> pullRequests;
     private List<GitRequest> issues;
+    private Map<String, String> ldapMap;
     private final List<Pattern> commitExclusionPatterns = new ArrayList<>();
 
 
@@ -100,6 +103,14 @@ public class DefaultGitHubClient implements GitHubClient {
     }
 
 
+    protected void setLdapMap(Map<String, String> ldapMap) {
+        this.ldapMap = ldapMap;
+    }
+
+    protected Map<String, String> getLdapMap() {
+        return ldapMap;
+    }
+
     @Override
     @SuppressWarnings("PMD.ExcessiveMethodLength")
     public void fireGraphQL(GitHubRepo repo, boolean firstRun, Map<Long, String> existingPRMap, Map<Long, String> existingIssueMap) throws RestClientException, MalformedURLException, HygieiaException {
@@ -112,7 +123,7 @@ public class DefaultGitHubClient implements GitHubClient {
         commits = new LinkedList<>();
         pullRequests = new LinkedList<>();
         issues = new LinkedList<>();
-
+        ldapMap = new HashMap<>();
         long historyTimeStamp = getTimeStampMills(getRunDate(repo, firstRun, false));
 
         String decryptedPassword = decryptString(repo.getPassword(), settings.getKey());
@@ -120,8 +131,8 @@ public class DefaultGitHubClient implements GitHubClient {
         String decryptPersonalAccessToken = decryptString(personalAccessToken, settings.getKey());
         boolean alldone = false;
 
-        GitHubPaging dummyPRPaging = isThereNewPRorIssue(gitHubParsed, repo, decryptedPassword, decryptPersonalAccessToken,existingPRMap, "pull", firstRun);
-        GitHubPaging dummyIssuePaging = isThereNewPRorIssue(gitHubParsed, repo, decryptedPassword,decryptPersonalAccessToken, existingIssueMap, "issue", firstRun);
+        GitHubPaging dummyPRPaging = isThereNewPRorIssue(gitHubParsed, repo, decryptedPassword, decryptPersonalAccessToken, existingPRMap, "pull", firstRun);
+        GitHubPaging dummyIssuePaging = isThereNewPRorIssue(gitHubParsed, repo, decryptedPassword, decryptPersonalAccessToken, existingIssueMap, "issue", firstRun);
         GitHubPaging dummyCommitPaging = new GitHubPaging();
         dummyCommitPaging.setLastPage(false);
 
@@ -130,7 +141,7 @@ public class DefaultGitHubClient implements GitHubClient {
         int loopCount = 1;
         while (!alldone) {
             LOG.debug("Executing loop " + loopCount + " for " + gitHubParsed.getOrgName() + "/" + gitHubParsed.getRepoName());
-            ResponseEntity<String> response = makeRestCallPost(graphQLurl, repo.getUserId(), decryptedPassword,decryptPersonalAccessToken, query);
+            ResponseEntity<String> response = makeRestCallPost(graphQLurl, repo.getUserId(), decryptedPassword, decryptPersonalAccessToken, query);
             JSONObject data = (JSONObject) parseAsObject(response).get("data");
             JSONArray errors = getArray(parseAsObject(response), "errors");
 
@@ -186,7 +197,7 @@ public class DefaultGitHubClient implements GitHubClient {
         int missingCommitCount = 0;
         while (!alldone) {
             LOG.debug("Executing loop " + loopCount + " for " + gitHubParsed.getOrgName() + "/" + gitHubParsed.getRepoName());
-            ResponseEntity<String> response = makeRestCallPost(graphQLurl, repo.getUserId(), decryptedPassword,decryptPersonalAccessToken, query);
+            ResponseEntity<String> response = makeRestCallPost(graphQLurl, repo.getUserId(), decryptedPassword, decryptPersonalAccessToken, query);
             JSONObject data = (JSONObject) parseAsObject(response).get("data");
             JSONArray errors = getArray(parseAsObject(response), "errors");
 
@@ -213,7 +224,7 @@ public class DefaultGitHubClient implements GitHubClient {
     }
 
     @SuppressWarnings("PMD.NPathComplexity")
-    private GitHubPaging isThereNewPRorIssue(GitHubParsed gitHubParsed, GitHubRepo repo, String decryptedPassword,String personalAccessToken, Map<Long, String> existingMap, String type, boolean firstRun) throws HygieiaException {
+    private GitHubPaging isThereNewPRorIssue(GitHubParsed gitHubParsed, GitHubRepo repo, String decryptedPassword, String personalAccessToken, Map<Long, String> existingMap, String type, boolean firstRun) throws HygieiaException {
 
         GitHubPaging paging = new GitHubPaging();
         paging.setLastPage(true);
@@ -235,7 +246,7 @@ public class DefaultGitHubClient implements GitHubClient {
         query.put("variables", variableJSON.toString());
 
 
-        ResponseEntity<String> response = makeRestCallPost(gitHubParsed.getGraphQLUrl(), repo.getUserId(), decryptedPassword,personalAccessToken, query);
+        ResponseEntity<String> response = makeRestCallPost(gitHubParsed.getGraphQLUrl(), repo.getUserId(), decryptedPassword, personalAccessToken, query);
         JSONObject data = (JSONObject) parseAsObject(response).get("data");
         JSONArray errors = getArray(parseAsObject(response), "errors");
 
@@ -495,18 +506,23 @@ public class DefaultGitHubClient implements GitHubClient {
             }
             if (!StringUtils.isEmpty(merged)) {
                 pull.setScmRevisionNumber(str((JSONObject) node.get("mergeCommit"), "oid"));
-                pull.setResolutiontime((mergedTimestamp - createdTimestamp) / (24 * 3600000));
+                pull.setResolutiontime((mergedTimestamp - createdTimestamp));
                 pull.setScmCommitTimestamp(mergedTimestamp);
                 pull.setMergedAt(mergedTimestamp);
                 JSONObject commitsObject = (JSONObject) node.get("commits");
                 pull.setNumberOfChanges(commitsObject != null ? asInt(commitsObject, "totalCount") : 0);
-                List<Commit> prCommits = getPRCommits(commitsObject, pull);
+                List<Commit> prCommits = getPRCommits(repo, commitsObject, pull);
                 pull.setCommits(prCommits);
-                List<Comment> comments = getComments((JSONObject) node.get("comments"));
+                List<Comment> comments = getComments(repo, (JSONObject) node.get("comments"));
                 pull.setComments(comments);
-                List<Review> reviews = getReviews((JSONObject) node.get("reviews"));
+                List<Review> reviews = getReviews(repo, (JSONObject) node.get("reviews"));
                 pull.setReviews(reviews);
-                pull.setScmMergeEventRevisionNumber(getMergeEventSha(pull, (JSONObject) node.get("timeline")));
+                MergeEvent mergeEvent = getMergeEvent(repo, pull, (JSONObject) node.get("timeline"));
+                if (mergeEvent != null) {
+                    pull.setScmMergeEventRevisionNumber(mergeEvent.getMergeSha());
+                    pull.setMergeAuthor(mergeEvent.getMergeAuthor());
+                    pull.setMergeAuthorLDAPDN(mergeEvent.getMergeAuthorLDAPDN());
+                }
             }
             // commit etc details
             pull.setSourceBranch(str(node, "headRefName"));
@@ -542,6 +558,7 @@ public class DefaultGitHubClient implements GitHubClient {
         return paging;
     }
 
+    @SuppressWarnings("PMD.NPathComplexity")
     private GitHubPaging processCommits(JSONObject refObject, GitHubRepo repo) {
         GitHubPaging paging = new GitHubPaging();
         paging.setLastPage(true); //initialize
@@ -576,7 +593,7 @@ public class DefaultGitHubClient implements GitHubClient {
             String message = str(node, "message");
             String authorName = str(authorJSON, "name");
             String authorLogin = authorUserJSON == null ? "unknown" : str(authorUserJSON, "login");
-
+            String authorLDAPDN = "unknown".equalsIgnoreCase(authorLogin) ? null : getLDAPDN(repo, authorLogin);
             Commit commit = new Commit();
             commit.setTimestamp(System.currentTimeMillis());
             commit.setScmUrl(repo.getRepoUrl());
@@ -584,6 +601,9 @@ public class DefaultGitHubClient implements GitHubClient {
             commit.setScmRevisionNumber(sha);
             commit.setScmAuthor(authorName);
             commit.setScmAuthorLogin(authorLogin);
+            if (!StringUtils.isEmpty(authorLDAPDN)) {
+                commit.setScmAuthorLDAPDN(authorLDAPDN);
+            }
             commit.setScmCommitLog(message);
             commit.setScmCommitTimestamp(getTimeStampMills(str(authorJSON, "date")));
             commit.setNumberOfChanges(1);
@@ -639,7 +659,7 @@ public class DefaultGitHubClient implements GitHubClient {
                 issue.setScmCommitTimestamp(updatedTimestamp);
                 issue.setClosedAt(updatedTimestamp);
                 issue.setMergedAt(updatedTimestamp);
-                issue.setResolutiontime((updatedTimestamp - createdTimestamp) / (24 * 3600000));
+                issue.setResolutiontime((updatedTimestamp - createdTimestamp));
             }
             issue.setUserId(name);
             issue.setScmUrl(gitHubParsed.getUrl());
@@ -676,7 +696,7 @@ public class DefaultGitHubClient implements GitHubClient {
         return paging;
     }
 
-    private List<Comment> getComments(JSONObject commentsJSON) throws RestClientException {
+    private List<Comment> getComments(GitHubRepo repo, JSONObject commentsJSON) throws RestClientException {
 
         List<Comment> comments = new ArrayList<>();
         if (commentsJSON == null) {
@@ -691,6 +711,10 @@ public class DefaultGitHubClient implements GitHubClient {
             Comment comment = new Comment();
             comment.setBody(str(node, "bodyText"));
             comment.setUser(str((JSONObject) node.get("author"), "login"));
+            String userLDAP = getLDAPDN(repo, comment.getUser());
+            if (!StringUtils.isEmpty(userLDAP)) {
+                comment.setUserLDAPDN(userLDAP);
+            }
             comment.setCreatedAt(getTimeStampMills(str(node, "createdAt")));
             comment.setUpdatedAt(getTimeStampMills(str(node, "updatedAt")));
             comment.setStatus(str(node, "state"));
@@ -700,7 +724,7 @@ public class DefaultGitHubClient implements GitHubClient {
     }
 
     @SuppressWarnings({"PMD.NPathComplexity"})
-    private List<Commit> getPRCommits(JSONObject commits, GitRequest pull) {
+    private List<Commit> getPRCommits(GitHubRepo repo, JSONObject commits, GitRequest pull) {
         List<Commit> prCommits = new ArrayList<>();
 
         if (commits == null) {
@@ -711,7 +735,7 @@ public class DefaultGitHubClient implements GitHubClient {
         if (CollectionUtils.isEmpty(nodes)) {
             return prCommits;
         }
-        JSONObject  lastCommitStatusObject = null;
+        JSONObject lastCommitStatusObject = null;
         long lastCommitTime = 0L;
         for (Object n : nodes) {
             JSONObject c = (JSONObject) n;
@@ -723,6 +747,10 @@ public class DefaultGitHubClient implements GitHubClient {
             JSONObject authorUserJSON = (JSONObject) author.get("user");
             newCommit.setScmAuthor(str(author, "name"));
             newCommit.setScmAuthorLogin(authorUserJSON == null ? "unknown" : str(authorUserJSON, "login"));
+            String authorLDAPDN = "unknown".equalsIgnoreCase(newCommit.getScmAuthorLogin()) ? null : getLDAPDN(repo, newCommit.getScmAuthorLogin());
+            if (!StringUtils.isEmpty(authorLDAPDN)) {
+                newCommit.setScmAuthorLDAPDN(authorLDAPDN);
+            }
             newCommit.setScmCommitTimestamp(getTimeStampMills(str(author, "date")));
             JSONObject statusObj = (JSONObject) commit.get("status");
 
@@ -777,7 +805,7 @@ public class DefaultGitHubClient implements GitHubClient {
         return new ArrayList<>(statuses.values());
     }
 
-    private List<Review> getReviews(JSONObject reviewObject) throws RestClientException {
+    private List<Review> getReviews(GitHubRepo repo, JSONObject reviewObject) throws RestClientException {
 
         List<Review> reviews = new ArrayList<>();
 
@@ -798,11 +826,52 @@ public class DefaultGitHubClient implements GitHubClient {
             review.setBody(str(node, "bodyText"));
             JSONObject authorObj = (JSONObject) node.get("author");
             review.setAuthor(str(authorObj, "login"));
+            String authorLDAPDN = getLDAPDN(repo, review.getAuthor());
+            if (!StringUtils.isEmpty(authorLDAPDN)) {
+                review.setAuthorLDAPDN(authorLDAPDN);
+            }
             review.setCreatedAt(getTimeStampMills(str(node, "createdAt")));
             review.setUpdatedAt(getTimeStampMills(str(node, "updatedAt")));
             reviews.add(review);
         }
         return reviews;
+    }
+
+    private MergeEvent getMergeEvent(GitHubRepo repo, GitRequest pr, JSONObject timelineObject) throws RestClientException {
+        if (timelineObject == null) {
+            return null;
+        }
+        JSONArray edges = (JSONArray) timelineObject.get("edges");
+        if (CollectionUtils.isEmpty(edges)) {
+            return null;
+        }
+
+        for (Object e : edges) {
+            JSONObject edge = (JSONObject) e;
+            JSONObject node = (JSONObject) edge.get("node");
+            if (node != null) {
+                String typeName = str(node, "__typename");
+                if ("MergedEvent".equalsIgnoreCase(typeName)) {
+                    JSONObject timelinePrNbrObj = (JSONObject) node.get("pullRequest");
+                    if (timelinePrNbrObj != null && pr.getNumber().equals(str(timelinePrNbrObj, "number"))) {
+                        MergeEvent mergeEvent = new MergeEvent();
+                        JSONObject commit = (JSONObject) node.get("commit");
+                        mergeEvent.setMergeSha(str(commit, "oid"));
+                        mergeEvent.setMergedAt(getTimeStampMills(str(node, "createdAt")));
+                        JSONObject author = (JSONObject) node.get("actor");
+                        if (author != null) {
+                            mergeEvent.setMergeAuthor(str(author, "login"));
+                            String mergeAuthorLDAPDN = getLDAPDN(repo, mergeEvent.getMergeAuthor());
+                            if (!StringUtils.isEmpty(mergeAuthorLDAPDN)) {
+                                mergeEvent.setMergeAuthorLDAPDN(mergeAuthorLDAPDN);
+                            }
+                        }
+                        return mergeEvent;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     private String getMergeEventSha(GitRequest pr, JSONObject timelineObject) throws RestClientException {
@@ -856,7 +925,7 @@ public class DefaultGitHubClient implements GitHubClient {
         JSONObject query = new JSONObject();
         query.put("query", GitHubGraphQLQuery.QUERY_RATE_LIMIT);
         ResponseEntity<String> response = null;
-        response = makeRestCallPost(gitHubParsed.getGraphQLUrl(), repo.getUserId(), decryptedPassword,decryptPersonalAccessToken, query);
+        response = makeRestCallPost(gitHubParsed.getGraphQLUrl(), repo.getUserId(), decryptedPassword, decryptPersonalAccessToken, query);
         JSONObject data = (JSONObject) parseAsObject(response).get("data");
         JSONArray errors = getArray(parseAsObject(response), "errors");
         if (data == null) return null;
@@ -874,6 +943,34 @@ public class DefaultGitHubClient implements GitHubClient {
         rateLimit.setResetTime(rateLimitResetAt);
 
         return rateLimit;
+    }
+
+    @Override
+    public String getLDAPDN(GitHubRepo repo, String user) {
+        if (StringUtils.isEmpty(user)) return null;
+        //This is weird. Github does replace the _ in commit author with - in the user api!!!
+        String formattedUser = user.replace("_", "-");
+        if (ldapMap.get(formattedUser) != null) {
+            return ldapMap.get(formattedUser);
+        }
+        String repoUrl = (String) repo.getOptions().get("url");
+        try {
+            GitHubParsed gitHubParsed = new GitHubParsed(repoUrl);
+            String apiUrl = gitHubParsed.getBaseApiUrl();
+
+            String queryUrl = apiUrl.concat("users/").concat(formattedUser);
+
+            ResponseEntity<String> response = makeRestCallGet(queryUrl);
+            JSONObject jsonObject = parseAsObject(response);
+            String ldapDN = str(jsonObject, "ldap_dn");
+            if (!StringUtils.isEmpty(ldapDN)) {
+                ldapMap.put(formattedUser, ldapDN);
+            }
+            return str(jsonObject, "ldap_dn");
+        } catch (MalformedURLException | HygieiaException | RestClientException e) {
+            LOG.error("Error getting LDAP_DN For user " + user, e);
+        }
+        return null;
     }
 
     /// Utility Methods
@@ -945,7 +1042,7 @@ public class DefaultGitHubClient implements GitHubClient {
         return dateInstance.minusDays(offsetDays).minusMinutes(offsetMinutes);
     }
 
-    private ResponseEntity<String> makeRestCallPost(String url, String userId,String password, String personalAccessToken, JSONObject query) {
+    private ResponseEntity<String> makeRestCallPost(String url, String userId, String password, String personalAccessToken, JSONObject query) {
         // Basic Auth only.
         if (!Objects.equals("", userId) && !Objects.equals("", password)) {
             return restOperations.exchange(url, HttpMethod.POST, new HttpEntity<Object>(query, createHeaders(userId, password)), String.class);
@@ -957,6 +1054,20 @@ public class DefaultGitHubClient implements GitHubClient {
             return restOperations.exchange(url, HttpMethod.POST, new HttpEntity<Object>(query, null), String.class);
         }
     }
+
+    private ResponseEntity<String> makeRestCallGet(String url) throws RestClientException {
+        // Basic Auth only.
+        if (settings.getPersonalAccessToken() != null && !Objects.equals("", settings.getPersonalAccessToken())) {
+            return restOperations.exchange(url, HttpMethod.GET,
+                    new HttpEntity<>(createHeaders(settings.getPersonalAccessToken())),
+                    String.class);
+        } else {
+            return restOperations.exchange(url, HttpMethod.GET, null,
+                    String.class);
+        }
+
+    }
+
 
     private HttpHeaders createHeaders(final String userId, final String password) {
         String auth = userId + ":" + password;
@@ -1009,6 +1120,7 @@ public class DefaultGitHubClient implements GitHubClient {
 
     /**
      * Decrypt string
+     *
      * @param string
      * @param key
      * @return String
